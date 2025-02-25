@@ -38,9 +38,25 @@ https://github.com/aquasecurity/btfhub-archive/
 
 ## 怎么理解 watch 结果中内核耗时的可视化部分 ?
 
-![kyanos time detail](/timedetail.jpg)  
-图中的 `eth0@if483` 是容器 NIC，`eth0` 是宿主机 NIC。  
-图上半部分是请求从进程发送到 NIC 的过程，下半部分是响应从 NIC 到进程的过程。
+![kyanos time detail](/faq-time-detail.png)  
+每一个方块代表数据包经过的节点，从上面依次看起，第一个是 Process，代表请求从进程发出，到右边第二个节点 eth0@if483，这是容器内部的网卡设备，后边有一个(used: 0.02ms)代表从上一个节点 process 到容器内部网卡花费了 0.02ms。
+
+以此类推，再到右边的 eth0 即为宿主机网卡，并且可以知道从容器网卡到虚拟机网卡花费了 0.02ms。
+
+然后请求从网卡发出，到网卡接收到响应（即为图中所示的向下箭头），花费了 13.37ms，之后就是响应接收的流程，从右往左。
+
+接着容器接收响应花费 0.06ms，再到响应数据复制到 TCP 缓存区花费了 0.06ms，最后进程从缓冲区读取数据花费了 0.11ms。
+
+可以清楚的看到请求从进程发送到网卡，响应再从网卡复制到 Socket 缓冲区并且被进程读取的流程和每一个步骤的耗时。
+
+## 运行 kyanos 后没有观察到 http 流量?
+
+确认你想监控的协议不是 HTTP2，因为 kyanos 目前尚未支持。
+
+## 为什么抓取到的请求数量明显少于真实的请求数量？
+在大流量的情况下 kyanos 可能抓取不到完整的请求数据，检查 `/tmp` 目录下的 kyanos 日志，如果出现 `[dataReader] lost xx syscall data events` 的日志说明正是这种情况。
+
+如果想尽可能的抓取请求可以加上 `--trace-dev-event=false --trace-socket-data` 这个选项，加上该选项后不会抓取数据经过网卡和`socket buffer`的事件，将所有处理能力用于解析 syscall 数据上（目前通过 syscall 数据解析请求和响应）
 
 ## 运行后终端表格颜色不正确（比如无法选择表格中的记录）
 

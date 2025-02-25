@@ -73,6 +73,7 @@ func LoadBPF(options *ac.AgentOptions) (*BPF, error) {
 	collectionOptions = &ebpf.CollectionOptions{
 		Programs: ebpf.ProgramOptions{
 			KernelTypes: btfSpec,
+			LogLevel:    ebpf.LogLevelInstruction,
 		},
 	}
 
@@ -86,6 +87,9 @@ func LoadBPF(options *ac.AgentOptions) (*BPF, error) {
 		}
 		filterFunctions(spec, *options.Kv)
 		err = spec.LoadAndAssign(lagacyobjs, collectionOptions)
+		if err != nil {
+			return nil, err
+		}
 		objs = AgentObjectsFromLagacyKernel310(lagacyobjs)
 	} else {
 		objs = &bpf.AgentObjects{}
@@ -95,6 +99,9 @@ func LoadBPF(options *ac.AgentOptions) (*BPF, error) {
 		}
 		filterFunctions(spec, *options.Kv)
 		err = spec.LoadAndAssign(objs, collectionOptions)
+		if err != nil {
+			return nil, err
+		}
 	}
 	bf.Objs = objs
 	bpf.Objs = objs
@@ -142,7 +149,7 @@ func (bf *BPF) AttachProgs(options *ac.AgentOptions) error {
 	bf.attachExecEventChannels(options)
 	bf.attachExitEventChannels(options)
 
-	if !options.DisableOpensslUprobe {
+	if options.WatchOptions.TraceSslEvent {
 		uprobeSchedEventChannel := make(chan *bpf.AgentProcessExecEvent, 10)
 		uprobe.StartHandleSchedExecEvent(uprobeSchedEventChannel)
 		execEventChannels := []chan *bpf.AgentProcessExecEvent{uprobeSchedEventChannel}
@@ -151,7 +158,7 @@ func (bf *BPF) AttachProgs(options *ac.AgentOptions) error {
 		}
 		bpf.PullProcessExecEvents(options.Ctx, &execEventChannels)
 
-		attachOpenSslUprobes(links, options, options.Kv, bf.Objs)
+		attachUprobes(links, options, options.Kv, bf.Objs)
 		options.LoadPorgressChannel <- "🍕 Attached ssl eBPF programs."
 	}
 	attachSchedProgs(links)
@@ -166,7 +173,7 @@ func (bf *BPF) attachExecEventChannels(options *ac.AgentOptions) {
 	execEventChannelForMetadata := make(chan *bpf.AgentProcessExecEvent, execEventChannelBufferSize)
 	execEventChannels = append(execEventChannels, execEventChannelForMetadata)
 	metadata.StartHandleSchedExecEvent(execEventChannelForMetadata, options.Ctx)
-	if !options.DisableOpensslUprobe {
+	if options.WatchOptions.TraceSslEvent {
 		uprobeSchedEventChannel := make(chan *bpf.AgentProcessExecEvent, execEventChannelBufferSize)
 		uprobe.StartHandleSchedExecEvent(uprobeSchedEventChannel)
 		execEventChannels = append(execEventChannels, uprobeSchedEventChannel)
@@ -447,7 +454,7 @@ func isProcNameMacthed(proc *process.Process, filterComm string) bool {
 	return false
 }
 
-func attachBpfProgs(ifName string, kernelVersion *compatible.KernelVersion, options *ac.AgentOptions) (l *list.List, err error) {
+func attachBpfProgs(ifName string, kernelVersion *compatible.KernelVersion, options *ac.AgentOptions) (links *list.List, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			common.AgentLog.Errorf("Recovered in attachBpfProgs: %v", r)
@@ -481,6 +488,9 @@ func attachBpfProgs(ifName string, kernelVersion *compatible.KernelVersion, opti
 		if options.PerformanceMode && isNonCriticalStep {
 			continue
 		}
+		if !traceStep(*options, step) {
+			continue
+		}
 		for idx, function := range functions {
 			var err error
 			var l link.Link
@@ -499,63 +509,188 @@ func attachBpfProgs(ifName string, kernelVersion *compatible.KernelVersion, opti
 					if isNonCriticalStep {
 						common.AgentLog.Debugf("Attach failed: %v, functions: %v skip it because it's a non-criticalstep", err, functions)
 					} else {
-						return nil, fmt.Errorf("Attach failed: %v, functions: %v", err, functions)
+						return nil, fmt.Errorf("attach failed: %v, functions: %v", err, functions)
 					}
 				} else {
 					common.AgentLog.Debugf("Attach failed but has fallback: %v, functions: %v", err, functions)
 				}
 			} else {
 				linkList.PushBack(l)
-				break
+				if idx < len(functions)-1 && !functions[idx+1].IsBackup() {
+					continue
+				} else {
+					break
+				}
 			}
 		}
 	}
 
-	linkList.PushBack(bpf.AttachSyscallAcceptEntry())
-	linkList.PushBack(bpf.AttachSyscallAcceptExit())
+	l, err := bpf.AttachSyscallAcceptEntry()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
 
-	linkList.PushBack(bpf.AttachSyscallSockAllocExit())
+	l, err = bpf.AttachSyscallAcceptExit()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
 
-	linkList.PushBack(bpf.AttachSyscallConnectEntry())
-	linkList.PushBack(bpf.AttachSyscallConnectExit())
+	l, err = bpf.AttachSyscallSockAllocExit()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
 
-	linkList.PushBack(bpf.AttachSyscallCloseEntry())
-	linkList.PushBack(bpf.AttachSyscallCloseExit())
+	l, err = bpf.AttachSyscallConnectEntry()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
 
-	linkList.PushBack(bpf.AttachSyscallWriteEntry())
-	linkList.PushBack(bpf.AttachSyscallWriteExit())
+	l, err = bpf.AttachSyscallConnectExit()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
 
-	linkList.PushBack(bpf.AttachSyscallSendMsgEntry())
-	linkList.PushBack(bpf.AttachSyscallSendMsgExit())
+	l, err = bpf.AttachSyscallCloseEntry()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
 
-	linkList.PushBack(bpf.AttachSyscallSendFile64Entry())
-	linkList.PushBack(bpf.AttachSyscallSendFile64Exit())
+	l, err = bpf.AttachSyscallCloseExit()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
 
-	linkList.PushBack(bpf.AttachSyscallRecvMsgEntry())
-	linkList.PushBack(bpf.AttachSyscallRecvMsgExit())
+	l, err = bpf.AttachSyscallWriteEntry()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
 
-	linkList.PushBack(bpf.AttachSyscallWritevEntry())
-	linkList.PushBack(bpf.AttachSyscallWritevExit())
+	l, err = bpf.AttachSyscallWriteExit()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
 
-	linkList.PushBack(bpf.AttachSyscallSendtoEntry())
-	linkList.PushBack(bpf.AttachSyscallSendtoExit())
+	l, err = bpf.AttachSyscallSendMsgEntry()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
 
-	linkList.PushBack(bpf.AttachSyscallReadEntry())
-	linkList.PushBack(bpf.AttachSyscallReadExit())
+	l, err = bpf.AttachSyscallSendMsgExit()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
 
-	linkList.PushBack(bpf.AttachSyscallReadvEntry())
-	linkList.PushBack(bpf.AttachSyscallReadvExit())
+	l, err = bpf.AttachSyscallSendFile64Entry()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
 
-	linkList.PushBack(bpf.AttachSyscallRecvfromEntry())
-	linkList.PushBack(bpf.AttachSyscallRecvfromExit())
+	l, err = bpf.AttachSyscallSendFile64Exit()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
 
-	linkList.PushBack(bpf.AttachKProbeSecuritySocketRecvmsgEntry())
-	linkList.PushBack(bpf.AttachKProbeSecuritySocketSendmsgEntry())
+	l, err = bpf.AttachSyscallRecvMsgEntry()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
+
+	l, err = bpf.AttachSyscallRecvMsgExit()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
+
+	l, err = bpf.AttachSyscallWritevEntry()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
+
+	l, err = bpf.AttachSyscallWritevExit()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
+
+	l, err = bpf.AttachSyscallSendtoEntry()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
+
+	l, err = bpf.AttachSyscallSendtoExit()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
+
+	l, err = bpf.AttachSyscallReadEntry()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
+
+	l, err = bpf.AttachSyscallReadExit()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
+
+	l, err = bpf.AttachSyscallReadvEntry()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
+
+	l, err = bpf.AttachSyscallReadvExit()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
+
+	l, err = bpf.AttachSyscallRecvfromEntry()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
+
+	l, err = bpf.AttachSyscallRecvfromExit()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
+
+	l, err = bpf.AttachKProbeSecuritySocketRecvmsgEntry()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
+
+	l, err = bpf.AttachKProbeSecuritySocketSendmsgEntry()
+	if err != nil {
+		return nil, err
+	}
+	linkList.PushBack(l)
 
 	return linkList, nil
 }
 
-func attachOpenSslUprobes(links *list.List, options *ac.AgentOptions, kernelVersion *compatible.KernelVersion, objs any) {
+func attachUprobes(links *list.List, options *ac.AgentOptions, kernelVersion *compatible.KernelVersion, objs any) {
 	pids, err := common.GetAllPids()
 	loadGoTlsErr := uprobe.LoadGoTlsUprobe()
 	if loadGoTlsErr != nil {
@@ -628,4 +763,18 @@ func getNonCriticalSteps() map[bpf.AgentStepT]bool {
 		bpf.AgentStepTQDISC_OUT: true,
 		bpf.AgentStepTIP_IN:     true,
 	}
+}
+
+var stepToOptions = map[bpf.AgentStepT]func(ac.AgentOptions) bool{
+	bpf.AgentStepTDEV_IN:    func(options ac.AgentOptions) bool { return options.WatchOptions.TraceDevEvent },
+	bpf.AgentStepTDEV_OUT:   func(options ac.AgentOptions) bool { return options.WatchOptions.TraceDevEvent },
+	bpf.AgentStepTTCP_IN:    func(options ac.AgentOptions) bool { return options.WatchOptions.TraceSocketEvent },
+	bpf.AgentStepTUSER_COPY: func(options ac.AgentOptions) bool { return options.WatchOptions.TraceSocketEvent },
+}
+
+func traceStep(options ac.AgentOptions, step bpf.AgentStepT) bool {
+	if f, ok := stepToOptions[step]; ok {
+		return f(options)
+	}
+	return true
 }

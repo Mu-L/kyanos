@@ -106,13 +106,14 @@ type ParsedMessage interface {
 }
 ```
 
-| Method Name        | Function                                                                                              |
-| ------------------ | ----------------------------------------------------------------------------------------------------- |
-| `FormatToString()` | Formats the message into a string representation.                                                     |
-| `TimestampNs()`    | Returns the timestamp of the message (in nanoseconds).                                                |
-| `ByteSize()`       | Returns the byte size of the message.                                                                 |
-| `IsReq()`          | Determines if the message is a request.                                                               |
-| `Seq()`            | Returns the sequence number of the byte stream.(Obtain Seq from `streamBuffer.Head().LeftBoundary()`) |
+| Method Name        | Function                                                                                                                                |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `FormatToString()` | Formats the message into a string representation.                                                                                       |
+| `TimestampNs()`    | Returns the timestamp of the message (in nanoseconds).                                                                                  |
+| `ByteSize()`       | Returns the byte size of the message.                                                                                                   |
+| `IsReq()`          | Determines if the message is a request.                                                                                                 |
+| `Seq()`            | Returns the sequence number of the byte stream.(Obtain Seq from `streamBuffer.Head().LeftBoundary()`)                                   |
+| `StreamId()`       | Return the StreamId of the message. For most protocols, you can directly return 0. This is used for multiplexed protocols like HTTP2.。 |
 
 Example for HTTP:
 
@@ -142,7 +143,7 @@ interface:
 type ProtocolStreamParser interface {
 	ParseStream(streamBuffer *buffer.StreamBuffer, messageType MessageType) ParseResult
 	FindBoundary(streamBuffer *buffer.StreamBuffer, messageType MessageType, startPos int) int
-	Match(reqStream *[]ParsedMessage, respStream *[]ParsedMessage) []Record
+	Match(reqStream *ParsedMessageQueue, respStream *ParsedMessageQueue) []Record
 }
 ```
 
@@ -271,6 +272,8 @@ type ProtocolFilter interface {
 | `FilterByRequest`  | Filters based on requests.      |
 | `FilterByResponse` | Filters based on responses.     |
 
+Additionally, you need to add the corresponding protocol name to `supportedProtocols` in `watch.go`.
+
 ## Step.5-Register Protocol Parser
 
 Add an init function in your module to write it into the `ParsersMap`, for
@@ -284,10 +287,38 @@ func init() {
 }
 ```
 
+Finally, add the corresponding protocol name translation to `ProtocolNamesMap` in `common.go`
+
 ## Step.6-Add e2e Tests
 
 Add e2e tests for the corresponding protocol in the testdata directory. You can
 refer to the implementation of other protocols (e.g., `test_redis.sh`).
+
+Then add your test steps in ./github/workflows/test.yml:
+
+```yaml
+- name: Your Test name
+        uses: cilium/little-vm-helper@97c89f004bd0ab4caeacfe92ebc956e13e362e6b # v0.0.19
+        with:
+          provision: 'false'
+          cmd: |
+            set -ex
+            uname -a
+            cat /etc/issue
+            if [ -f "/var/lib/kyanos/btf/current.btf" ]; then
+                bash /host/testdata/YOUR_TEST_SCRIPT.sh 'sudo /host/kyanos/kyanos $kyanos_log_option --btf /var/lib/kyanos/btf/current.btf'
+            else
+                bash /host/testdata/YOUR_TEST_SCRIPT.sh 'sudo /host/kyanos/kyanos $kyanos_log_option'
+            fi
+```
+
+💡 Hint: Initially, you can place your test at the beginning of the workflow to
+quickly execute your test and identify issues.
+
+### Add Protocol Parsing Unit Tests
+
+Add unit tests for the three functions of your `ProtocolParser`, simulating the
+corresponding protocol input cases to complete the tests.
 
 ## Others
 

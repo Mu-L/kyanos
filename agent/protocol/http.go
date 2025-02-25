@@ -30,7 +30,12 @@ var HTTP_BOUNDARY_MARKER = "\r\n\r\n"
 type HTTPStreamParser struct {
 }
 
-func (h *HTTPStreamParser) Match(reqStream *[]ParsedMessage, respStream *[]ParsedMessage) []Record {
+func (h *HTTPStreamParser) Match(reqStreams map[StreamId]*ParsedMessageQueue, respStreams map[StreamId]*ParsedMessageQueue) []Record {
+	reqStream, ok1 := reqStreams[0]
+	respStream, ok2 := respStreams[0]
+	if !ok1 || !ok2 {
+		return []Record{}
+	}
 	return matchByTimestamp(reqStream, respStream)
 }
 
@@ -122,55 +127,90 @@ func (h *HTTPStreamParser) ParseRequest(buf string, messageType MessageType, tim
 	}
 }
 
-func (h HTTPStreamParser) ParseResponse(buf string, messageType MessageType, timestamp uint64, seq uint64) ParseResult {
+func (h *HTTPStreamParser) ParseResponse(buf string, messageType MessageType, timestamp uint64, seq uint64, streamBuffer *buffer.StreamBuffer) ParseResult {
 	reader := strings.NewReader(buf)
 	bufioReader := bufio.NewReader(reader)
 	resp, err := http.ReadResponse(bufioReader, nil)
 	parseResult := ParseResult{}
 	if err != nil {
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			return ParseResult{
-				ParseState: NeedsMoreData,
-			}
-		} else {
-			return ParseResult{
-				ParseState: Invalid,
-			}
+		return h.handleReadResponseError(err, buf, streamBuffer, messageType, timestamp, seq)
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return h.handleReadBodyError(err, buf, streamBuffer, messageType, timestamp, seq)
+	}
+
+	readIndex := common.GetBufioReaderReadIndex(bufioReader)
+	if readIndex == 0 && len(respBody) > 0 {
+		readIndex = len(buf)
+	} else if readIndex == 0 {
+		return ParseResult{
+			ParseState: NeedsMoreData,
+		}
+	}
+	parseResult.ReadBytes = readIndex
+	parseResult.ParsedMessages = []ParsedMessage{
+		&ParsedHttpResponse{
+			FrameBase: NewFrameBase(timestamp, readIndex, seq),
+			buf:       []byte(buf[:readIndex]),
+		},
+	}
+	parseResult.ParseState = Success
+	return parseResult
+}
+
+func (h *HTTPStreamParser) handleReadResponseError(err error, buf string, streamBuffer *buffer.StreamBuffer, messageType MessageType, timestamp uint64, seq uint64) ParseResult {
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		return ParseResult{
+			ParseState: NeedsMoreData,
 		}
 	} else {
-		respBody, err := io.ReadAll(resp.Body)
-		if err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				return ParseResult{
-					ParseState: NeedsMoreData,
-				}
-			} else {
-				return ParseResult{
-					ParseState: Invalid,
-				}
-			}
+		return ParseResult{
+			ParseState: Invalid,
 		}
-		readIndex := common.GetBufioReaderReadIndex(bufioReader)
-		if readIndex == 0 && len(respBody) > 0 {
-			readIndex = len(buf)
-		} else if readIndex == 0 {
-			return ParseResult{
-				ParseState: NeedsMoreData,
-			}
-		}
-		parseResult.ReadBytes = readIndex
+	}
+}
+
+func (h *HTTPStreamParser) handleReadBodyError(err error, buf string, streamBuffer *buffer.StreamBuffer, messageType MessageType, timestamp uint64, seq uint64) ParseResult {
+	parseResult := ParseResult{}
+	boundary := h.FindBoundary(streamBuffer, messageType, 0)
+	if boundary > 0 {
+		parseResult.ReadBytes = boundary
 		parseResult.ParsedMessages = []ParsedMessage{
 			&ParsedHttpResponse{
-				FrameBase: NewFrameBase(timestamp, readIndex, seq),
-				buf:       []byte(buf[:readIndex]),
+				FrameBase: NewFrameBase(timestamp, boundary, seq),
+				buf:       []byte(buf[:boundary]),
 			},
 		}
 		parseResult.ParseState = Success
 		return parseResult
+	} else if fakeDataIdx, _ := fakeDataMarkIndex([]byte(buf)); fakeDataIdx != -1 {
+		fakeDataSize := getFakeDataSize([]byte(buf), fakeDataIdx)
+		if len(buf) >= fakeDataIdx+int(fakeDataSize)+fakeDataMarkLen {
+			parseResult.ReadBytes = fakeDataIdx + int(fakeDataSize) + fakeDataMarkLen
+			parseResult.ParsedMessages = []ParsedMessage{
+				&ParsedHttpResponse{
+					FrameBase: NewFrameBase(timestamp, parseResult.ReadBytes, seq),
+					buf:       []byte(buf[:parseResult.ReadBytes]),
+				},
+			}
+			parseResult.ParseState = Success
+			return parseResult
+		}
+	}
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		return ParseResult{
+			ParseState: NeedsMoreData,
+		}
+	} else {
+		return ParseResult{
+			ParseState: Invalid,
+		}
 	}
 }
 
-func (h HTTPStreamParser) ParseStream(streamBuffer *buffer.StreamBuffer, messageType MessageType) ParseResult {
+func (h *HTTPStreamParser) ParseStream(streamBuffer *buffer.StreamBuffer, messageType MessageType) ParseResult {
 	head := streamBuffer.Head()
 	buf := string(head.Buffer())
 	ts, ok := streamBuffer.FindTimestampBySeq(head.LeftBoundary())
@@ -183,7 +223,7 @@ func (h HTTPStreamParser) ParseStream(streamBuffer *buffer.StreamBuffer, message
 	case Request:
 		return h.ParseRequest(buf, messageType, ts, head.LeftBoundary())
 	case Response:
-		return h.ParseResponse(buf, messageType, ts, head.LeftBoundary())
+		return h.ParseResponse(buf, messageType, ts, head.LeftBoundary(), streamBuffer)
 	default:
 		panic("messageType invalid")
 	}
@@ -214,6 +254,10 @@ func (req *ParsedHttpRequest) IsReq() bool {
 	return true
 }
 
+func (req *ParsedHttpRequest) StreamId() StreamId {
+	return 0
+}
+
 type ParsedHttpResponse struct {
 	FrameBase
 	buf []byte
@@ -231,6 +275,10 @@ func (resp *ParsedHttpResponse) FormatToString() string {
 }
 func (resp *ParsedHttpResponse) IsReq() bool {
 	return false
+}
+
+func (req *ParsedHttpResponse) StreamId() StreamId {
+	return 0
 }
 
 var _ ProtocolFilter = HttpFilter{}

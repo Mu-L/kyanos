@@ -26,13 +26,16 @@ import (
 	"syscall"
 	"time"
 
+	_ "net/http/pprof"
+
 	"github.com/cilium/ebpf/rlimit"
 	gops "github.com/google/gops/agent"
 )
 
 func SetupAgent(options ac.AgentOptions) {
-	err := version.UpgradeDetect()
-	if err != nil {
+	startGopsServer(options)
+
+	if err := version.UpgradeDetect(); err != nil {
 		if errors.Is(err, version.ErrBehindLatest) {
 			common.AgentLog.Warn(err)
 		}
@@ -57,7 +60,6 @@ func SetupAgent(options ac.AgentOptions) {
 		common.AgentLog.Warnf("Your terminal does not support 256 colors, ui may display incorrectly")
 	}
 
-	// startGopsServer(options)
 	options = ac.ValidateAndRepairOptions(options)
 	common.LaunchEpochTime = GetMachineStartTimeNano()
 	stopper := options.Stopper
@@ -74,7 +76,7 @@ func SetupAgent(options ac.AgentOptions) {
 	if options.ConnManagerInitHook != nil {
 		options.ConnManagerInitHook(connManager)
 	}
-	statRecorder := analysis.InitStatRecorder()
+	statRecorder := analysis.InitStatRecorder(&options)
 
 	var recordsChannel chan *anc.AnnotatedRecord = nil
 	recordsChannel = make(chan *anc.AnnotatedRecord, 1000)
@@ -98,13 +100,14 @@ func SetupAgent(options ac.AgentOptions) {
 
 	var _bf loader.BPF
 	go func(_bf *loader.BPF) {
+		defer wg.Done()
 		options.LoadPorgressChannel <- "🍩 Kyanos starting..."
 		kernelVersion := compatible.GetCurrentKernelVersion()
 		options.Kv = &kernelVersion
 		var err error
 		defer func() {
 			if err != nil {
-				common.AgentLog.Error("Failed to load BPF programs: ", err)
+				common.AgentLog.Errorf("Failed to load BPF programs: %+v", errors.Unwrap(errors.Unwrap(err)))
 				_bf.Err = err
 				options.LoadPorgressChannel <- "❌ Kyanos start failed"
 				options.LoadPorgressChannel <- "quit"
@@ -151,7 +154,6 @@ func SetupAgent(options ac.AgentOptions) {
 			time.Sleep(500 * time.Millisecond)
 			options.LoadPorgressChannel <- "quit"
 		}
-		defer wg.Done()
 	}(&_bf)
 	defer func() {
 		_bf.Close()
@@ -242,7 +244,7 @@ Submit issue: https://github.com/hengyoush/kyanos/issues
 }
 
 func startGopsServer(opts ac.AgentOptions) {
-	if opts.WatchOptions.DebugOutput {
+	if opts.StartGopsServer {
 		if err := gops.Listen(gops.Options{}); err != nil {
 			common.AgentLog.Fatalf("agent.Listen err: %v", err)
 		} else {
